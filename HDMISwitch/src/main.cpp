@@ -1,39 +1,64 @@
 #include <Arduino.h>
-
- // --------------------------------------
-// i2c_scanner
-//
-// Version 1
-//    This program (or code that looks like it)
-//    can be found in many places.
-//    For example on the Arduino.cc forum.
-//    The original author is not know.
-// Version 2, Juni 2012, Using Arduino 1.0.1
-//     Adapted to be as simple as possible by Arduino.cc user Krodal
-// Version 3, Feb 26  2013
-//    V3 by louarnold
-// Version 4, March 3, 2013, Using Arduino 1.0.3
-//    by Arduino.cc user Krodal.
-//    Changes by louarnold removed.
-//    Scanning addresses changed from 0...127 to 1...119,
-//    according to the i2c scanner by Nick Gammon
-//    https://www.gammon.com.au/forum/?id=10896
-// Version 5, March 28, 2013
-//    As version 4, but address scans now to 127.
-//    A sensor seems to use address 120.
-// Version 6, November 27, 2015.
-//    Added waiting for the Leonardo serial communication.
-// 
-//
-// This sketch tests the standard 7-bit addresses
-// Devices with higher bit address might not be seen properly.
-//
-
 #include <Wire.h>
+#include <Bounce2.h>
+#include <SoftWire.h>
+//#include <AsyncDelay.h>
 
-byte lenMagicNum = 0x80;
-byte hostSlaveAddr = 0x51;
-byte edidHeader[8] = {0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00};
+
+// Constants
+const byte lenMagicNum = 0x80;
+const byte hostSlaveAddr = 0x51;
+const byte edidHeader[8] = {0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00};
+
+const int numMonitors = 2;
+const int maxSupportedMonitorInputs = 8;
+
+const int ledPin = 13;
+const uint8_t setupButtonPin = 2;
+const int numModes = 4;
+const uint8_t modeButtonPins[numModes] = {3,4,5,6};
+const int i2cPins[numMonitors][2] = {{7,8},{8,10}};
+Bounce setupButton = Bounce();
+Bounce * modeButtons = new Bounce[numModes];
+SoftWire * i2cMonitorPorts[numMonitors];
+byte i2cMonitorTxBuffers[numMonitors][32];
+byte i2cMonitorRxBuffers[numMonitors][32];
+
+const int loopDelay = 50; // 20 times per second
+const int settingsMaxCount = 3*(1000/loopDelay);
+const int settingsMenu[5][4] = {{1,2,4,0}, // Main - 0: Change setup button behaviour, 1: Change turn on behaviour, 2: Configure monitor input switching
+                                {0,0,0,0}, // Setup button behaviour - 0: mode select, 1: input cycling
+                                {0,0,3,2}, // Turn on behaviour - 0: As turn off, 1: Do not change, 2: choose
+                                {0,0,0,0}, // Turn on behaviour mode select - 0: turn on to mode 0, 1 turn on to mode 1 etc.
+                                {0,0,0,0}  // Monitor input switching config : 0: Automatic detection (order will likely be wrong), 1: Match mode order (likely in order but may miss extras), 2: Match mode order + autodetected (likely in order but may have extras)
+                              };
+
+// Eeprom loaded values
+//REVISIT EEPROM loaded values - can change after
+int idleBehaviour = 0; // 0 is mode select, 1 is input switching // REVISIT : Will be loaded from eeprom
+int turnOnBehaviour = 0; // -1 is previous state, -2 is just leave, others are just button saves.  // REVISIT : Will be loaded from eeprom
+byte monitorModes[numModes][numMonitors] = {{0xFF, 0xFF},{0xFF, 0xFF},{0xFF, 0xFF},{0xFF, 0xFF}}; // REVISIT : Will be loaded from eeprom
+byte currentMonitorMode[numMonitors] = {0xFF, 0xFF, 0xFF}; // REVISIT : Will be loaded from eeprom
+byte monitorInputs[numMonitors][maxSupportedMonitorInputs] = {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},  // REVISIT : Will be loaded from eeprom
+                                                              {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
+
+
+// State values
+int state = 0; // 0 - idle, 1 - checking if settings mode, 2 - settings mode
+bool doneAction = 0;
+int settingsCounter = 0;
+int settingsPage  = 0; // 0 is main menu, 1 is setup button behaviour (values 0, 1 as above), 2 is turn on behaviour 
+bool modeSelected = false;
+int selectedMode = -1;
+
+
+// Temporary values
+bool setupButtonStatus = false;
+bool modeButtonStatus[5] = {false,false,false,false,false};
+
+
+
+
 
 void setup()
 {
@@ -41,9 +66,29 @@ void setup()
   TWBR = 158; // Make clock really slow!
   //TWSR |= bit (TWPS0);
 
-  Serial.begin(9600);
+  Serial.begin(9600); // REVISIT - for debug only
   while (!Serial);             // Leonardo: wait for serial monitor
   Serial.println("\nI2C Scanner");
+
+  // Set up input buttons
+  setupButton.attach( setupButtonPin , INPUT_PULLUP  );       //setup the bounce instance for the current button
+  setupButton.interval(25);              // interval in ms
+
+  for (int i = 0; i < numModes; i++) {
+    modeButtons[i].attach( modeButtonPins[i] , INPUT_PULLUP  );       //setup the bounce instance for the current button
+    modeButtons[i].interval(25);              // interval in ms
+  }
+
+
+  for (int i = 0; i < numMonitors; i++) {
+    i2cMonitorPorts[i] = new SoftWire(i2cPins[i][0], i2cPins[i][1]);
+    i2cMonitorPorts[i].setTxBuffer(i2cMonitorTxBuffers[i], sizeof(i2cMonitorTxBuffers[i]));
+    i2cMonitorPorts[i].setRxBuffer(i2cMonitorRxBuffers[i], sizeof(i2cMonitorRxBuffers[i]));
+    i2cMonitorPorts[i].setDelay_us(5);
+    i2cMonitorPorts[i].setTimeout(1000);
+    i2cMonitorPorts[i].begin(); // REVISIT : could begin and end as required? check usage/power
+  }
+
 }
 
 
@@ -65,11 +110,6 @@ bool i2cRead(byte addr, byte *Buffer, int startIdx, int numBytes)
     Buffer[i] = Wire.read();
     i+=1;
   }
-  //Serial.print("Read got bytes num: ");
-  //Serial.print(i-startIdx);
-  //Serial.print(", out of: ");
-  //Serial.println(numBytes);
-
   if (i-startIdx != numBytes) {
     return 1;
   }
@@ -113,19 +153,9 @@ int ddcWrite(byte addr, int numBytes, byte *Buffer)
   return Wire.endTransmission();
 }
 
+
 int ddcRead(byte addr, byte offset, byte *Buffer, int startIdx, int numBytes, int incr = 32) 
 {
-  //Serial.print("Start of ddcRead: ");
-  //Serial.print(addr, HEX);
-  //Serial.print(", ");
-  //Serial.print(offset, HEX);
-  //Serial.print(", ");
-  //Serial.print(startIdx);
-  //Serial.print(", ");
-  //Serial.print(numBytes);
-  //Serial.print(", ");
-  //Serial.println(incr);
-
   byte wrData[1];
   int wrResult;
   int thisNumBytes;
@@ -134,20 +164,10 @@ int ddcRead(byte addr, byte offset, byte *Buffer, int startIdx, int numBytes, in
 
   for (int i=offset; i<maxOffset; i+=incr) {
     thisNumBytes = min(maxOffset-i, 32);
-    //Serial.print("ddcReadLoop: ");
-    //Serial.print(i);
-    //Serial.print(", ");
-    //Serial.print(i, HEX);
-    //Serial.print(", ");
-    //Serial.println(thisNumBytes);
     wrData[0] = i;
     wrResult = i2cWrite(addr, 1, wrData);
-    //Serial.print("i2c write result: ");
-    //Serial.println(wrResult);
-    //Serial.print("i2c read result: ");
     i2cRead(addr, Buffer, i, thisNumBytes);
   }
-  //Serial.println("ddcReadDone");
 }
 
 
@@ -179,234 +199,237 @@ bool edid_read()
 {
   byte Buffer[256];
   bool match;
-  //int wrResult;
-  //byte wrData[1];
-  //
-  //for (int i=0; i<255; i+=32) {
-  //  wrData[0] = i;
-  //  wrResult = i2cWrite(0x50, 1, wrData);
-  //  i2cRead(0x50, Buffer, i, 32);
-  //}
   ddcRead(0x50, 0x00, Buffer, 0, 256, 32);
-
   match = doArraysMatch(8, Buffer, edidHeader);
-
-  Serial.print("EDID data: ");
-  print_byte_array(256, Buffer);
-  Serial.println("");
+  //Serial.print("EDID data: ");
+  //print_byte_array(256, Buffer);
+  //Serial.println("");
+  return match;
 }
 
 
-bool strange_thing() 
+int getSelectedMode() 
 {
-  byte Buffer00[5];
-  byte Buffer40[1];
+  for (int i=0; i<numModes; i++) {
+    if (modeButtonStatus[i]) {
+      return i;
+    }
+  }
+  return -1;
+}
 
-  ddcRead(0x3A, 0x00, Buffer00, 0, 5, 32);
-  ddcRead(0x3A, 0x40, Buffer40, 0, 1, 32);
-  Serial.print("3A, 00: ");
-  print_byte_array(5, Buffer00);
-  Serial.println("");
-  Serial.print("3A, 40: ");
-  print_byte_array(1, Buffer40);
-  Serial.println("");
+
+void setSetupMode(int modeSelected) 
+{
+  // REVISIT: needs saving to eeprom
+  idleBehaviour = modeSelected;
+}
+
+
+void setDefaultMode(int page, int modeSelected) 
+{
+  // REVISIT: needs saving to eeprom
+  if (page==0) {
+    turnOnBehaviour = -1-modeSelected;
+  } else if (page==1) {
+    turnOnBehaviour = modeSelected;
+  }
+}
+
+
+void getMonitorStates(byte *monitorStates) 
+{
+  // For each monitor
+    // Check if active
+    // Read from 0x37, 60
+    // Store value
+    // If anything failed, write 0xFF
+}
+
+
+void saveMode(int selectedMode) 
+{
+  
+  // Get monitor states
+  byte monitorStates[numMonitors];
+  getMonitorStates(monitorStates);
+
+  // Set values in selected slot
+  //monitorModes[selectedMode] = monitorStates; // REVISIT : This may not work. syntax, may need to loop or something
+
+  // REVISIT: needs saving to eeprom
+}
+
+
+bool isMonitorInputPresent(byte inputVal) 
+{
+  // read edid
+}
+
+
+void setMonitorInputsAuto(bool override) 
+{
+  // for each monitor
+    // If override, delete all values
+    // for each possible input
+      // is this input already present - if so skip
+      // is the input connected? --  //isMonitorInputPresent(inputVal)
+        // set this value
+}
+
+
+void setMonitorInputsFromModes() {
+  // For each mode
+    // For each monitor 
+      // If input value not already present in monitorInputs[numMonitors][maxSupportedMonitorInputs]
+        // add value to monitorInputs[numMonitors][maxSupportedMonitorInputs]
+}
+
+
+void setMonitorInputs(int selectedMode) 
+{
+  //monitorInputs[numMonitors][maxSupportedMonitorInputs]
+  switch (selectedMode) {
+    case 0 : // Full auto
+      setMonitorInputsAuto(true);
+      break;
+
+    case 1 : // Extract from modes
+      setMonitorInputsFromModes();
+      break;
+
+    case 2 : // Extract from modes plus auto
+      setMonitorInputsFromModes();
+      setMonitorInputsAuto(false);
+      break;
+
+  }
+
+
 
 }
 
 
-
-int monitorConnect() {
-
-  // Check monitor is working
-  byte Buffer[4];
-  bool monitorCheck;
-  Buffer[0] = 0x00;
-  while (Buffer[0] == 0x00) {
-    monitorCheck = i2cRead(0x50, Buffer, 0, 1);
-    print_byte_array(4, Buffer);
-  Serial.println("");
-  }
-  Serial.print("Monitor check: ");
-  Serial.println(monitorCheck);
-  Serial.print("Monitor check value: ");
-  print_byte_array(4, Buffer);
-  Serial.println("");
-
-  delay(250);
-
-  // Read all EDID
-  edid_read();
+void selectMonitorInput(int monitor, int mode) 
+{
+  // Select i2c port -- would be needed with hardware i2c switching, with software it is just an array select
+  // Send i2c write command
+  i2cMonitorPorts[i]
+  // Read back?
+  // Retry????
+}
 
 
-  // Some other stuff with 0x3A , 0x00, 0x40, 0x80
-  for (int i=0; i<16; i++) {
-    strange_thing();
-    delay(300);
-  }
-//
+void setMode(int selectedMode) 
+{
+  // For each monitor
+    // Set input to monitorModes[selectedMode][monitorI] = selectMonitorInput
+
+  // Set currentMonitorMode
+
+  // if turn on mode is to set to previous value
+    // Save to eeprom
+
+}
+
+
+void incrementInput(int selectedMonitor) 
+{
+  // find current position currentMonitorMode[selectedMonitor] in monitorInputs[selectedMonitor]
+  // Find next value, N+1 or 0 if N+1==0xFF or out of range 
+  // Set monitor to +1 of that index, loop around if next value is 0xFF
+  // selectMonitorInput
+
 }
 
 
 void loop()
 {
-  //byte error, address;
-  //int nDevices;
-//
-  //Serial.println("Scanning...");
-//
-  //nDevices = 0;
-  //for(address = 1; address < 127; address++ ) 
-  //{
-  //  // The i2c_scanner uses the return value of
-  //  // the Write.endTransmisstion to see if
-  //  // a device did acknowledge to the address.
-  //  Wire.beginTransmission(address);
-  //  error = Wire.endTransmission();
-//
-  //  if (error == 0)
-  //  {
-  //    Serial.print("I2C device found at address 0x");
-  //    if (address<16) 
-  //      Serial.print("0");
-  //    Serial.print(address,HEX);
-  //    Serial.println("  !");
-//
-  //    nDevices++;
-  //  }
-  //  else if (error==4) 
-  //  {
-  //    Serial.print("Unknown error at address 0x");
-  //    if (address<16) 
-  //      Serial.print("0");
-  //    Serial.println(address,HEX);
-  //  }    
-  //}
-  //if (nDevices == 0)
-  //  Serial.println("No I2C devices found\n");
-  //else
-  //  Serial.println("done\n");
-
-
-  //for (int i=0; i<256; i++) {
-  //  Wire.beginTransmission(0x3A); 
-  //  Wire.write(i);        //address of the byte  to read from
-  //  Wire.endTransmission();
-  //  delay(5);
-//
-  //  Wire.requestFrom(0x3A,1); // gets the value from the address mentioned above
-  //  delay(10);
-  //  if(Wire.available()){
-  //    byte data = Wire.read();
-  //    Serial.print(data, HEX);
-  //    Serial.print(" ");
-  //  } 
-  //  delay(50);           // wait .05 seconds for next 
-  //}
-
-
-
-
-
-
-  // THIS SHOULD SUCCESSFULLY READ SOME DDC DATA
-          //Wire.beginTransmission(0x37); 
-          //Wire.write(0x51); // Host slave address
-          //Wire.write(0x84); // Length 3?
-          //Wire.write(0x03); // Capabilities request COMMAND
-          //Wire.write(0x60); // Offset byte?
-          //Wire.write(0x00); // Offset byte?
-          //Wire.write(0x03); // Offset byte?
-          //Wire.write(0xD9); // Checksum
-          //Serial.println(Wire.endTransmission());
-        //byte Buffer0[4] = {0x03, 0x60, 0x00, 0x03};
-        //ddcWrite(0x37, 4, Buffer0);
-//
-//
-        //delay(2000);
-        //byte Buffer1[4] = {0x03, 0x60, 0x00, 0x01};
-        //ddcWrite(0x37, 4, Buffer1);
-
-
-
-
-
-
-        //byte Buffer1[4]
-
-        // Read state of input select register
-        //ddcRead(0x37, 0x60, Buffer2, 0, 11, 32);
-        // Check checksum
-        // Get input value from position 9
-
-
-
-
-
-
-          //Wire.requestFrom(0x37,12);
-          //delay(50);
-          //while (Wire.available()){
-          //  byte data = Wire.read();
-          //  Serial.print(data, HEX);
-          //  Serial.print(" ");
-          //} 
-  // END THIS SHOULD SUCCESSFULLY READ SOME DDC DATA
-
-
-
-
-
-
-// write to 0x3A ack data: 0x00 
-// read to 0x3A ack data: 0xAC 0xB8 0x1D 0x78 0x66
-// write to 0x3A ack data: 0x40 
-// read to 0x3A ack data: 0x80
-// write to 0x3A ack data: 0x00 
-// read to 0x3A ack data: 0xAC 0xB8 0x1D 0x78 0x66
-
-
-  //monitorConnect();
-
-
-  delay(5000);           // wait 5 seconds for next scan
-
-
-
-
-
-
 
   // Interrupt routine for button press
+  // function changeI2cAddr(idx);
 
 
+  delay(loopDelay); // Sample inputs 20 times per second... Maybe sleep and wakeup on interrupt
 
+  // Temporarily, just sample here
+  setupButton.update();
+  setupButtonStatus = setupButton.read();
+  for (int i=0;i<numModes;i++)
+  {
+    modeButtons[i].update();
+    modeButtonStatus[i] = modeButtons[i].read();
+  }
+  // end sample
 
+  // Which mode button is pressed?
+  selectedMode = getSelectedMode();
+  modeSelected = selectedMode > -1 ;
 
-  // normal
-    // Wait for button presses
-    // On button press enter that mode
-    // If press was setup button, enter, input select mode
-    // If press and hold setup and a button for 3 seconds, record that as a new mode
-    
+  // Main state machine
+  if (!doneAction) {
+    if (state == 0) { // idle
+        
+      if (setupButtonStatus) {
+        state = 1; // Check for update settings mode
+      } else if (modeSelected) {
+        if (idleBehaviour == 0) {
+          setMode(selectedMode);
+        } else if (idleBehaviour == 1) {
+          incrementInput(selectedMode);
+        }
+        doneAction = true;
+      }
+    } else if (state == 1) { // Checking if going into settings
+      settingsCounter += 1;
+      if (settingsCounter >= settingsMaxCount) {
+        doneAction = true;
+        settingsCounter = 0;
+        if (modeSelected) {
+          saveMode(selectedMode);
+          state = 0; // go back to idle
+        } else {
+          state = 2; // go into settings mode
+        }
+      }
+    } else if (state == 2) { // Settings mode
+      if (setupButtonStatus) {
+        // Exit settings mode
+        state = 0;
+        settingsPage = 0;
+        doneAction = true;
+      } else if (modeSelected) {
 
+        // Check menu state for action to perform
+        switch (settingsPage) {
+          case 1:
+            setSetupMode(selectedMode);
+            break;
+          case 2:
+            setDefaultMode(0, selectedMode);
+            break;
+          case 3:
+            setDefaultMode(1, selectedMode);
+            break;
+          case 4:
+            setMonitorInputs(selectedMode);
+            break;
+        }
 
+        // Navigate menu
+        settingsPage = settingsMenu[settingsPage][modeSelected];
+        doneAction = true;
+      } // If no button pressed, do nothing
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    } else {
+      // If in unknown state, go back to idle
+      state = 0;
+    }
+  } else {
+    if (!setupButtonStatus && !modeSelected) {
+      doneAction = false;
+    }
+  }
 
 
 }
