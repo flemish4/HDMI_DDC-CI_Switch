@@ -1,5 +1,4 @@
 #include <Arduino.h>
-#include <Wire.h>
 #include <Bounce2.h>
 #include <SoftWire.h>
 //#include <AsyncDelay.h>
@@ -17,10 +16,10 @@ const int ledPin = 13;
 const uint8_t setupButtonPin = 2;
 const int numModes = 4;
 const uint8_t modeButtonPins[numModes] = {3,4,5,6};
-const int i2cPins[numMonitors][2] = {{7,8},{8,10}};
+const int i2cPins[numMonitors][2] = {{7,8},{9,10}};
 Bounce setupButton = Bounce();
 Bounce * modeButtons = new Bounce[numModes];
-SoftWire * i2cMonitorPorts[numMonitors];
+SoftWire *i2cMonitorPorts[numMonitors];
 byte i2cMonitorTxBuffers[numMonitors][32];
 byte i2cMonitorRxBuffers[numMonitors][32];
 
@@ -38,7 +37,7 @@ const int settingsMenu[5][4] = {{1,2,4,0}, // Main - 0: Change setup button beha
 int idleBehaviour = 0; // 0 is mode select, 1 is input switching // REVISIT : Will be loaded from eeprom
 int turnOnBehaviour = 0; // -1 is previous state, -2 is just leave, others are just button saves.  // REVISIT : Will be loaded from eeprom
 byte monitorModes[numModes][numMonitors] = {{0xFF, 0xFF},{0xFF, 0xFF},{0xFF, 0xFF},{0xFF, 0xFF}}; // REVISIT : Will be loaded from eeprom
-byte currentMonitorMode[numMonitors] = {0xFF, 0xFF, 0xFF}; // REVISIT : Will be loaded from eeprom
+byte currentMonitorMode[numMonitors] = {0xFF, 0xFF}; // REVISIT : Will be loaded from eeprom
 byte monitorInputs[numMonitors][maxSupportedMonitorInputs] = {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},  // REVISIT : Will be loaded from eeprom
                                                               {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
 
@@ -62,7 +61,6 @@ bool modeButtonStatus[5] = {false,false,false,false,false};
 
 void setup()
 {
-  Wire.begin();
   TWBR = 158; // Make clock really slow!
   //TWSR |= bit (TWPS0);
 
@@ -82,42 +80,42 @@ void setup()
 
   for (int i = 0; i < numMonitors; i++) {
     i2cMonitorPorts[i] = new SoftWire(i2cPins[i][0], i2cPins[i][1]);
-    i2cMonitorPorts[i].setTxBuffer(i2cMonitorTxBuffers[i], sizeof(i2cMonitorTxBuffers[i]));
-    i2cMonitorPorts[i].setRxBuffer(i2cMonitorRxBuffers[i], sizeof(i2cMonitorRxBuffers[i]));
-    i2cMonitorPorts[i].setDelay_us(5);
-    i2cMonitorPorts[i].setTimeout(1000);
-    i2cMonitorPorts[i].begin(); // REVISIT : could begin and end as required? check usage/power
+    i2cMonitorPorts[i]->setTxBuffer(i2cMonitorTxBuffers[i], sizeof(i2cMonitorTxBuffers[i]));
+    i2cMonitorPorts[i]->setRxBuffer(i2cMonitorRxBuffers[i], sizeof(i2cMonitorRxBuffers[i]));
+    i2cMonitorPorts[i]->setDelay_us(5);
+    i2cMonitorPorts[i]->setTimeout(1000);
+    i2cMonitorPorts[i]->begin(); // REVISIT : could begin and end as required? check usage/power
   }
 
 }
 
 
-int i2cWrite(byte addr, int numBytes, byte *Buffer)
+bool i2cWrite(int monitor, byte addr, int numBytes, byte *Buffer)
 {
-  Wire.beginTransmission(addr); 
+  i2cMonitorPorts[monitor]->beginTransmission(addr); 
   for (int i=0; i<numBytes; i++) {
-    Wire.write(Buffer[i]);
+    i2cMonitorPorts[monitor]->write(Buffer[i]);
   }
-  return Wire.endTransmission();
+  return i2cMonitorPorts[monitor]->endTransmission() == 0;
 }
 
 
-bool i2cRead(byte addr, byte *Buffer, int startIdx, int numBytes)
+bool i2cRead(int monitor, byte addr, byte *Buffer, int startIdx, int numBytes)
 {
   int i = startIdx;
-  Wire.requestFrom(addr,numBytes);
-  while (Wire.available()){
-    Buffer[i] = Wire.read();
+  i2cMonitorPorts[monitor]->requestFrom(addr,numBytes);
+  while (i2cMonitorPorts[monitor]->available()){
+    Buffer[i] = i2cMonitorPorts[monitor]->read();
     i+=1;
   }
   if (i-startIdx != numBytes) {
-    return 1;
+    return false;
   }
-  return 0;
+  return true;
 }
 
 
-int ddcWrite(byte addr, int numBytes, byte *Buffer)
+bool ddcWrite(int monitor, byte addr, int numBytes, byte *Buffer)
 {
   byte trueAddr = addr << 1 | 0;
   byte trueLen = numBytes | lenMagicNum;
@@ -134,11 +132,11 @@ int ddcWrite(byte addr, int numBytes, byte *Buffer)
   Serial.print(", ");
 
 
-  Wire.beginTransmission(addr);
-  Wire.write(hostSlaveAddr);
-  Wire.write(trueLen);
+  i2cMonitorPorts[monitor]->beginTransmission(addr);
+  i2cMonitorPorts[monitor]->write(hostSlaveAddr);
+  i2cMonitorPorts[monitor]->write(trueLen);
   for (int i=0; i<numBytes; i++) {
-    Wire.write(Buffer[i]);
+    i2cMonitorPorts[monitor]->write(Buffer[i]);
     checkSum ^= Buffer[i];
     Serial.print("Buffer[i]: ");
     Serial.print(Buffer[i], HEX);
@@ -147,17 +145,17 @@ int ddcWrite(byte addr, int numBytes, byte *Buffer)
     Serial.print(checkSum, HEX);
     Serial.print(", ");
   }
-    Wire.write(checkSum);
+    i2cMonitorPorts[monitor]->write(checkSum);
   
     Serial.println("\n\n");
-  return Wire.endTransmission();
+  return i2cMonitorPorts[monitor]->endTransmission() == 0;
 }
 
 
-int ddcRead(byte addr, byte offset, byte *Buffer, int startIdx, int numBytes, int incr = 32) 
+bool ddcRead(int monitor, byte addr, byte offset, byte *Buffer, int startIdx, int numBytes, int incr = 32) 
 {
   byte wrData[1];
-  int wrResult;
+  bool result = true;
   int thisNumBytes;
   int maxOffset = offset + numBytes; 
 
@@ -165,9 +163,12 @@ int ddcRead(byte addr, byte offset, byte *Buffer, int startIdx, int numBytes, in
   for (int i=offset; i<maxOffset; i+=incr) {
     thisNumBytes = min(maxOffset-i, 32);
     wrData[0] = i;
-    wrResult = i2cWrite(addr, 1, wrData);
-    i2cRead(addr, Buffer, i, thisNumBytes);
+    result = result & i2cWrite(monitor, addr, 1, wrData);
+    result = result & i2cRead(monitor, addr, Buffer, i, thisNumBytes);
   }
+
+  // REVISIT : Check checksum 
+  return result;
 }
 
 
@@ -195,11 +196,11 @@ void print_byte_array(int len, byte *Buffer)
 }
 
 
-bool edid_read()
+bool edid_read(int monitor, int len)
 {
-  byte Buffer[256];
+  byte Buffer[len];
   bool match;
-  ddcRead(0x50, 0x00, Buffer, 0, 256, 32);
+  ddcRead(monitor, 0x50, 0x00, Buffer, 0, len, 32);
   match = doArraysMatch(8, Buffer, edidHeader);
   //Serial.print("EDID data: ");
   //print_byte_array(256, Buffer);
@@ -237,44 +238,89 @@ void setDefaultMode(int page, int modeSelected)
 }
 
 
+bool is_monitor_connected(int monitor) {
+  return edid_read(monitor, 8);
+}
+
+
+bool readMonitorInput(int monitor, byte *inputVal) 
+{
+  byte bufferInt[11];
+  return ddcRead(0x37, 0x60, bufferInt, 0, 11, 32);
+}
+
+
+bool writeMonitorInput(int monitor, byte inputVal) 
+{
+  byte bufferInt[4] = {0x03, 0x60, 0x00, inputVal};
+  return ddcWrite(monitor, 0x37, 4, bufferInt);
+}
+
+
 void getMonitorStates(byte *monitorStates) 
 {
+  byte result;
+  byte inputVal;
   // For each monitor
+  for (int i=0; i<numMonitors; i++) {
+    result = 0xFF; // Default value -- invalid
     // Check if active
-    // Read from 0x37, 60
-    // Store value
-    // If anything failed, write 0xFF
+    if (is_monitor_connected(i)) { // Check if monitor is on -- maybe unnecessary
+      if (readMonitorInput(i, inputVal)) // Read from ddc reg 60 (input) - only update result if it was successful
+      {
+        result = inputVal; // update result - monitor input value
+      }
+    }
+    monitorStates[i] = result; // Populate array
+  }
 }
 
 
 void saveMode(int selectedMode) 
 {
   
-  // Get monitor states
-  byte monitorStates[numMonitors];
-  getMonitorStates(monitorStates);
-
-  // Set values in selected slot
-  //monitorModes[selectedMode] = monitorStates; // REVISIT : This may not work. syntax, may need to loop or something
+  // Get monitor states, and set them in monitorModes for the selected mode
+  getMonitorStates(monitorModes[selectedMode]);
 
   // REVISIT: needs saving to eeprom
 }
 
 
-bool isMonitorInputPresent(byte inputVal) 
+bool isMonitorInputPresent(int monitor, byte inputVal) 
 {
-  // read edid
+  byte inputValRead;
+  // write to monitor to select input
+  writeMonitorInput(monitor, inputVal);
+
+  delay(50); // REVISIT : configurable?
+
+  // read back from monitor, if the value has stuck then the input is present
+  readMonitorInput(monitor, inputValRead);
+
+  return inputVal == inputValRead;
 }
 
 
 void setMonitorInputsAuto(bool override) 
 {
   // for each monitor
+  for (int i=0; i<numMonitors; i++) {
+
+    // If monitor not connected, skip
+    if (!is_monitor_connected(i) ) {
+      continue;
+    }
     // If override, delete all values
+    if (override) {
+      for (int j=0; j<maxSupportedMonitorInputs; j++) {
+        monitorInputs[i][j] = 0xFF;
+      }
+    }
     // for each possible input
       // is this input already present - if so skip
       // is the input connected? --  //isMonitorInputPresent(inputVal)
         // set this value
+  }
 }
 
 
@@ -314,7 +360,7 @@ void selectMonitorInput(int monitor, int mode)
 {
   // Select i2c port -- would be needed with hardware i2c switching, with software it is just an array select
   // Send i2c write command
-  i2cMonitorPorts[i]
+  
   // Read back?
   // Retry????
 }
