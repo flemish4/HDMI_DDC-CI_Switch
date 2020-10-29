@@ -12,6 +12,9 @@ const byte edidHeader[8] = {0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00};
 const int numMonitors = 2;
 const int maxSupportedMonitorInputs = 8;
 
+const byte maxDdcInputValSpec = 0x12;
+const byte maxDdcInputValMax  = 0xFF;
+
 const int ledPin = 13;
 const uint8_t setupButtonPin = 2;
 const int numModes = 4;
@@ -23,13 +26,14 @@ SoftWire *i2cMonitorPorts[numMonitors];
 byte i2cMonitorTxBuffers[numMonitors][32];
 byte i2cMonitorRxBuffers[numMonitors][32];
 
+const int i2cOperationDelay = 50; // ms between writing and reading from a location
 const int loopDelay = 50; // 20 times per second
 const int settingsMaxCount = 3*(1000/loopDelay);
 const int settingsMenu[5][4] = {{1,2,4,0}, // Main - 0: Change setup button behaviour, 1: Change turn on behaviour, 2: Configure monitor input switching
                                 {0,0,0,0}, // Setup button behaviour - 0: mode select, 1: input cycling
                                 {0,0,3,2}, // Turn on behaviour - 0: As turn off, 1: Do not change, 2: choose
                                 {0,0,0,0}, // Turn on behaviour mode select - 0: turn on to mode 0, 1 turn on to mode 1 etc.
-                                {0,0,0,0}  // Monitor input switching config : 0: Automatic detection (order will likely be wrong), 1: Match mode order (likely in order but may miss extras), 2: Match mode order + autodetected (likely in order but may have extras)
+                                {0,0,0,0}  // Monitor input switching config : 0: Automatic detection (order will likely be wrong), 1: Match mode order (likely in order but may miss extras), 2: Match mode order + autodetected (likely in order but may have extras), 3: Automatic detection (ordering will likely be wrong) - test ALL possible values
                               };
 
 // Eeprom loaded values
@@ -90,7 +94,7 @@ void setup()
 }
 
 
-bool i2cWrite(int monitor, byte addr, int numBytes, byte *Buffer)
+bool i2cWrite(int monitor, byte addr, int numBytes, byte Buffer[])
 {
   i2cMonitorPorts[monitor]->beginTransmission(addr); 
   for (int i=0; i<numBytes; i++) {
@@ -100,7 +104,7 @@ bool i2cWrite(int monitor, byte addr, int numBytes, byte *Buffer)
 }
 
 
-bool i2cRead(int monitor, byte addr, byte *Buffer, int startIdx, int numBytes)
+bool i2cRead(int monitor, byte addr, byte Buffer[], int startIdx, int numBytes)
 {
   int i = startIdx;
   i2cMonitorPorts[monitor]->requestFrom(addr,numBytes);
@@ -115,7 +119,7 @@ bool i2cRead(int monitor, byte addr, byte *Buffer, int startIdx, int numBytes)
 }
 
 
-bool ddcWrite(int monitor, byte addr, int numBytes, byte *Buffer)
+bool ddcWrite(int monitor, byte addr, int numBytes, byte Buffer[])
 {
   byte trueAddr = addr << 1 | 0;
   byte trueLen = numBytes | lenMagicNum;
@@ -152,7 +156,7 @@ bool ddcWrite(int monitor, byte addr, int numBytes, byte *Buffer)
 }
 
 
-bool ddcRead(int monitor, byte addr, byte offset, byte *Buffer, int startIdx, int numBytes, int incr = 32) 
+bool ddcRead(int monitor, byte addr, byte offset, byte Buffer[], int startIdx, int numBytes, int incr = 32) 
 {
   byte wrData[1];
   bool result = true;
@@ -172,7 +176,7 @@ bool ddcRead(int monitor, byte addr, byte offset, byte *Buffer, int startIdx, in
 }
 
 
-bool doArraysMatch(int len, byte *a, byte *b)
+bool doArraysMatch(int len, byte a[], const byte b[])
 {
   for (int i; i<len; i++) 
   {
@@ -184,7 +188,7 @@ bool doArraysMatch(int len, byte *a, byte *b)
 }
 
 
-void print_byte_array(int len, byte *Buffer)
+void print_byte_array(int len, byte Buffer[])
 {
   for (int i; i<len; i++) 
   {
@@ -245,9 +249,12 @@ bool is_monitor_connected(int monitor) {
 
 bool readMonitorInput(int monitor, byte *inputVal) 
 {
-  byte bufferInt[11];
-  return ddcRead(0x37, 0x60, bufferInt, 0, 11, 32);
+  byte bufferInt[11] = {};
+  bool result = ddcRead(monitor, 0x37, 0x60, bufferInt, 0, 11, 32);
+  *inputVal = bufferInt[9];
+  return result;
 }
+
 
 
 bool writeMonitorInput(int monitor, byte inputVal) 
@@ -257,7 +264,7 @@ bool writeMonitorInput(int monitor, byte inputVal)
 }
 
 
-void getMonitorStates(byte *monitorStates) 
+void getMonitorStates(byte monitorStates[]) 
 {
   byte result;
   byte inputVal;
@@ -266,7 +273,7 @@ void getMonitorStates(byte *monitorStates)
     result = 0xFF; // Default value -- invalid
     // Check if active
     if (is_monitor_connected(i)) { // Check if monitor is on -- maybe unnecessary
-      if (readMonitorInput(i, inputVal)) // Read from ddc reg 60 (input) - only update result if it was successful
+      if (readMonitorInput(i, &inputVal)) // Read from ddc reg 60 (input) - only update result if it was successful
       {
         result = inputVal; // update result - monitor input value
       }
@@ -286,23 +293,75 @@ void saveMode(int selectedMode)
 }
 
 
-bool isMonitorInputPresent(int monitor, byte inputVal) 
+bool selectMonitorInput(int monitor, byte inputVal) 
 {
-  byte inputValRead;
+  byte inputValRead = 0xFF;
   // write to monitor to select input
   writeMonitorInput(monitor, inputVal);
 
-  delay(50); // REVISIT : configurable?
+  delay(i2cOperationDelay); 
 
   // read back from monitor, if the value has stuck then the input is present
-  readMonitorInput(monitor, inputValRead);
+  readMonitorInput(monitor, &inputValRead);
 
   return inputVal == inputValRead;
 }
 
 
-void setMonitorInputsAuto(bool override) 
+int getPossibleInputs(int monitor, int maxValue, byte possibleInputs[]) {
+  int inputCount = 0;
+  bool inputPresent;
+  for (int i=0; i<maxValue; i++) {
+    inputPresent = selectMonitorInput(monitor, i);
+    if (inputPresent) {
+      possibleInputs[inputCount] = i;
+      inputCount += 1;
+    }
+  }
+  return inputCount;
+}
+
+
+// REVISIT : move this to generic function
+bool isValueInArray(byte arr[], int len, byte val)
 {
+   for (int i = 0; i < len; i++) {
+      if (arr[i] == val) {
+          return true;
+      }
+    }
+  return false;
+}
+
+
+int whereIsValueInArray(byte arr[], int len, byte val)
+{
+   for (int i = 0; i < len; i++) {
+      if (arr[i] == val) {
+          return i;
+      }
+    }
+  return -1;
+}
+
+
+byte getMonitorInputsMaxValidIdx(int monitor) {
+  for (int i=0; i<maxSupportedMonitorInputs; i++) {
+    if (monitorInputs[monitor][i] == (byte)0xFF) {
+      return i-1;
+    }
+  }
+  return maxSupportedMonitorInputs;
+}
+
+
+void setMonitorInputsAuto(bool override, bool checkAllValues) 
+{
+  int monitorInputsCurIdx;
+  int maxValue = checkAllValues ? maxDdcInputValMax : maxDdcInputValSpec;
+  int monitorMaxInputs;
+  byte possibleInputs[maxValue];
+
   // for each monitor
   for (int i=0; i<numMonitors; i++) {
 
@@ -316,19 +375,54 @@ void setMonitorInputsAuto(bool override)
         monitorInputs[i][j] = 0xFF;
       }
     }
-    // for each possible input
-      // is this input already present - if so skip
-      // is the input connected? --  //isMonitorInputPresent(inputVal)
-        // set this value
+
+    // Get possible inputs from monitor
+    monitorMaxInputs = getPossibleInputs(i, maxValue, possibleInputs);
+    // Get current max index for inputs
+    monitorInputsCurIdx = getMonitorInputsMaxValidIdx(i) + 1 ;
+
+    // For each possibleInput
+    for (int j=0; j<monitorMaxInputs; j++) {
+      // Check if the input is already in monitorInputs 
+      if (!isValueInArray(monitorInputs[i], maxSupportedMonitorInputs, possibleInputs[j])) 
+      {
+        // If it isn't, add it
+        monitorInputs[i][monitorInputsCurIdx] = possibleInputs[j];
+        // Increment the counter and ensure no more than maxSupportedMonitorInputs are added (8)
+        monitorInputsCurIdx += 1;
+        if (monitorInputsCurIdx >= maxSupportedMonitorInputs) {
+          return;
+        }
+      }
+    }
   }
 }
 
-
+// REVISIT : Share with function above setMonitorInputsAuto
 void setMonitorInputsFromModes() {
+  int monitorInputsCurIdx;
   // For each mode
+  for (int modeNum=0; modeNum<numModes; modeNum++) 
+  {
     // For each monitor 
-      // If input value not already present in monitorInputs[numMonitors][maxSupportedMonitorInputs]
-        // add value to monitorInputs[numMonitors][maxSupportedMonitorInputs]
+    for (int monNum=0; monNum<numMonitors; monNum++)
+    {
+      // Get current max index for inputs
+      monitorInputsCurIdx = getMonitorInputsMaxValidIdx(monNum) + 1 ;
+      // If mode monitor input not already present in monitorInputs[numMonitors][maxSupportedMonitorInputs]
+      if (!isValueInArray(monitorInputs[monNum], maxSupportedMonitorInputs, monitorModes[modeNum][monNum])) 
+      {   
+        // If it isn't, add it
+        monitorInputs[monNum][monitorInputsCurIdx] = monitorModes[modeNum][monNum];
+        // Increment the counter and ensure no more than maxSupportedMonitorInputs are added (8)
+        monitorInputsCurIdx += 1;
+        if (monitorInputsCurIdx >= maxSupportedMonitorInputs) {
+          return;
+        }
+
+      }
+    }
+  }
 }
 
 
@@ -337,7 +431,7 @@ void setMonitorInputs(int selectedMode)
   //monitorInputs[numMonitors][maxSupportedMonitorInputs]
   switch (selectedMode) {
     case 0 : // Full auto
-      setMonitorInputsAuto(true);
+      setMonitorInputsAuto(true, false);
       break;
 
     case 1 : // Extract from modes
@@ -346,9 +440,13 @@ void setMonitorInputs(int selectedMode)
 
     case 2 : // Extract from modes plus auto
       setMonitorInputsFromModes();
-      setMonitorInputsAuto(false);
+      setMonitorInputsAuto(false, false);
       break;
 
+    case 3 : // Full FULL auto
+      setMonitorInputsAuto(true, true);
+      break;
+      
   }
 
 
@@ -356,24 +454,16 @@ void setMonitorInputs(int selectedMode)
 }
 
 
-void selectMonitorInput(int monitor, int mode) 
-{
-  // Select i2c port -- would be needed with hardware i2c switching, with software it is just an array select
-  // Send i2c write command
-  
-  // Read back?
-  // Retry????
-}
-
-
 void setMode(int selectedMode) 
 {
-  // For each monitor
+  // For each monitor 
+  for (int monNum=0; monNum<numMonitors; monNum++)
+  {
     // Set input to monitorModes[selectedMode][monitorI] = selectMonitorInput
-
-  // Set currentMonitorMode
-
-  // if turn on mode is to set to previous value
+    selectMonitorInput(monNum, monitorModes[selectedMode][monNum]);
+    currentMonitorMode[monNum] = monitorModes[selectedMode][monNum];
+  }
+  // REVISIT: if turn on mode is to set to previous value
     // Save to eeprom
 
 }
@@ -382,9 +472,19 @@ void setMode(int selectedMode)
 void incrementInput(int selectedMonitor) 
 {
   // find current position currentMonitorMode[selectedMonitor] in monitorInputs[selectedMonitor]
+  byte curInputIdx = whereIsValueInArray(monitorInputs[selectedMonitor], maxSupportedMonitorInputs, currentMonitorMode[selectedMonitor]);
+
   // Find next value, N+1 or 0 if N+1==0xFF or out of range 
+  byte maxInputIdx = getMonitorInputsMaxValidIdx(selectedMonitor);
+
+  byte nxtInputIdx = curInputIdx == maxInputIdx ? 0 : curInputIdx + 1;
+
   // Set monitor to +1 of that index, loop around if next value is 0xFF
-  // selectMonitorInput
+  selectMonitorInput(selectedMonitor, nxtInputIdx);
+  currentMonitorMode[selectedMonitor] = nxtInputIdx; // REVISIT : Move into select monitor input
+
+  // REVISIT: if turn on mode is to set to previous value
+    // Save to eeprom
 
 }
 
