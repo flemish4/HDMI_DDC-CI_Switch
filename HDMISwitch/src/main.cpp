@@ -35,7 +35,8 @@
       const int i2cPins[numMonitors][2] = {{7,8},{9,10}};
 
     // Timing delays
-      const int i2cOperationDelay = 150; // ms between writing and reading from a location
+      const int i2cOperationDelay = 250; // ms between operations
+      const int i2cReadWriteDelay = 50; // ms between writing and reading from a location
       const int loopDelay = 50; // 20 times per second
       const int settingsMaxCount = 3*(1000/loopDelay);
 
@@ -218,7 +219,7 @@ void toggleLed()
 //// DDC Functons
 
   bool isChecksumValid(byte Buffer[], int len) {
-    byte calcChecksum = 0x00;
+    byte calcChecksum = 0;
     for (int i=0; i<len-1; i+=1) {
       calcChecksum ^= Buffer[i];
     }
@@ -263,7 +264,7 @@ void toggleLed()
   }
 
 //ddcRead(monitor, 0x37, 0x60, bufferInt, 11, 32);
-  bool ddcRead(int monitor, byte addr, byte offset, byte Buffer[], int numBytes, int incr = 32) 
+  bool ddcRead(int monitor, byte addr, byte offset, byte Buffer[], int numBytes, bool isDdcWrite = true, int incr = 32) 
   {
     Serial.print("ddcRead: ");
     Serial.print("monitor: ");
@@ -277,21 +278,33 @@ void toggleLed()
     Serial.print(", incr: ");
     Serial.println(incr);
     //debugPrint(3, "ddcRead monitor: %d, numBytes: %d, addr: %X, offset: %X", monitor, numBytes, addr, offset);
-    byte wrData[1];
+    byte wrData[2] = {};
     bool result = true;
     int thisNumBytes;
 
     for (int i=0; i<numBytes; i+=incr) {
+      if (i>0) {
+        delay(i2cOperationDelay);
+      }
       thisNumBytes = min(numBytes-i, 32);
-      wrData[0] = i+offset;
-      result = result & i2cWrite(monitor, addr, 1, wrData);
+      wrData[1] = i+offset;
+
+      if (isDdcWrite) {
+        wrData[0] = 0x01;
+        result = result & ddcWrite(monitor, addr, 2, wrData);
+      } else {
+        result = result & i2cWrite(monitor, addr, 1, &wrData[1]);
+      }
+      delay(i2cReadWriteDelay);
+      //result = result & i2cWrite(monitor, addr, 1, wrData);
       result = result & i2cRead(monitor, addr, Buffer, i, thisNumBytes);
+
     }
 
     // Check checksum 
     Serial.print(", result: ");
     Serial.println(result);
-    result = result & isChecksumValid(Buffer, numBytes);
+    result = result ; //& isChecksumValid(0x6E, Buffer, numBytes); REVISIT : Checksum not working correctly
     Serial.print(", result: ");
     Serial.println(result);
 
@@ -302,8 +315,8 @@ void toggleLed()
   {
     byte Buffer[len];
     bool match;
-    match = ddcRead(monitor, 0x50, 0x00, Buffer, len, 32);
-    match = match && doArraysMatch(8, Buffer, edidHeader);
+    ddcRead(monitor, 0x50, 0x00, Buffer, len, false, 32);
+    match = doArraysMatch(8, Buffer, edidHeader);
     //Serial.print("EDID data: ");
     //print_byte_array(Buffer, 256);
     //Serial.println("");
@@ -323,7 +336,7 @@ void toggleLed()
   bool readMonitorInput(int monitor, byte *inputVal) 
   {
     byte bufferInt[11] = {};
-    bool result = ddcRead(monitor, 0x37, 0x60, bufferInt, 11, 32);
+    bool result = ddcRead(monitor, 0x37, 0x60, bufferInt, 11, true, 32);
     Serial.print("readMonitorInput bufferInt = ");
     print_byte_array(bufferInt, 11);
     Serial.println("");
@@ -389,11 +402,16 @@ void toggleLed()
     byte inputVal;
     // For each monitor
     for (int i=0; i<numMonitors; i++) {
+      Serial.print("GetMonitorStates: ");
+      Serial.println(i);
       result = 0xFF; // Default value -- invalid
       // Check if active
       if (is_monitor_connected(i)) { // Check if monitor is on -- maybe unnecessary
+        Serial.println("is connected");
         if (readMonitorInput(i, &inputVal)) // Read from ddc reg 60 (input) - only update result if it was successful
         {
+          Serial.println("Got monitor input read successfully");
+          Serial.println(inputVal);
           result = inputVal; // update result - monitor input value
         }
       }
@@ -566,6 +584,9 @@ void toggleLed()
     // Get monitor states, and set them in monitorModes for the selected mode
     getMonitorStates(monitorModes[selectedMode]);
 
+    Serial.print("monitorModes[selectedMode] = ");
+    print_byte_array(monitorModes[selectedMode], numMonitors);
+    Serial.println("");
     // REVISIT: needs saving to eeprom
   }
 //// Settings Functions END
@@ -604,6 +625,10 @@ void toggleLed()
     print_byte_array(monitorInputs[selectedMonitor], maxSupportedMonitorInputs);
     Serial.println("");
 
+    Serial.print("currentMonitorMode[i] b= ");
+    Serial.print(currentMonitorMode[selectedMonitor], HEX);
+    Serial.println("");
+
     //debugPrint(3, "incrementInput");
     // find current position currentMonitorMode[selectedMonitor] in monitorInputs[selectedMonitor]
     byte curInputIdx = whereIsValueInArray(monitorInputs[selectedMonitor], maxSupportedMonitorInputs, currentMonitorMode[selectedMonitor]);
@@ -615,10 +640,12 @@ void toggleLed()
 
     byte nxtInputIdx = curInputIdx == maxInputIdx ? 0 : curInputIdx + 1;
     Serial.println(nxtInputIdx);
-
+    byte nxtInputVal = monitorInputs[selectedMonitor][nxtInputIdx];
+    Serial.print("nextinputval: ");
+    Serial.println(nxtInputVal);
     // Set monitor to +1 of that index, loop around if next value is 0xFF
-    selectMonitorInput(selectedMonitor, nxtInputIdx);
-    currentMonitorMode[selectedMonitor] = nxtInputIdx; // REVISIT : Move into select monitor input
+    selectMonitorInput(selectedMonitor, nxtInputVal);
+    currentMonitorMode[selectedMonitor] = nxtInputVal; // REVISIT : Move into select monitor input
 
     // REVISIT: if turn on mode is to set to previous value
       // Save to eeprom
