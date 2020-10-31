@@ -1,6 +1,8 @@
 #include <Arduino.h>
+#include <EEPROM.h>
 #include <Bounce2.h>
 #include <SoftWire.h>
+#include "TimerOne.h"
 #define ARDBUFFER 16
 #include <stdarg.h>
 
@@ -9,9 +11,7 @@
 // REVISITS:
 // Add optional serial debug function and reporting
 // Check all revisits
-// Prevent attempting to set monitor state to FF
-
-
+// eeprom stored values should probably be classes to group the dimensions, address, data, load and store functions.
 
 // Constants
   // Fundamental 
@@ -43,26 +43,61 @@
     // Settings menu
       const int settingsMenu[6][4] = {{1,2,4,5}, // Main - 0: Change setup button behaviour, 1: Change turn on behaviour, 2: Configure monitor input switching, 3: enable or disable serial
                                       {0,0,0,0}, // Setup button behaviour - 0: mode select, 1: input cycling
-                                      {0,0,3,2}, // Turn on behaviour - 0: As turn off, 1: Do not change, 2: choose
+                                      {0,0,3,2}, // Turn on behaviour - 0: Do not change, 1: As turn off, 2: choose mode on next page
                                       {0,0,0,0}, // Turn on behaviour mode select - 0: turn on to mode 0, 1 turn on to mode 1 etc.
                                       {0,0,0,0}, // Monitor input switching config : 0: Automatic detection (order will likely be wrong), 1: Match mode order (likely in order but may miss extras), 2: Match mode order + autodetected (likely in order but may have extras), 3: Automatic detection (ordering will likely be wrong) - test ALL possible values
                                       {0,0,0,0}  // Enable or disable serial debug levels : 0 : None, 1: Errors, 2: Warnings, 3: Debug
                                     };
 
     // Logging
-      const char debugLevelStr[4][5] = {"NORM", "ERR ", "WARN", "INFO"};
+      //const char debugLevelStr[4][5] = {"NORM", "ERR ", "WARN", "INFO"};
 
-// Semi constants - loaded from eeprom REVISIT
-  int  idleBehaviour = 0; // 0 is mode select, 1 is input switching                                                 // REVISIT : Will be loaded from eeprom
-  int  turnOnBehaviour = 0; // -1 is previous state, -2 is just leave, others are just button saves.                // REVISIT : Will be loaded from eeprom
-  byte monitorModes[numModes][numMonitors] = {{0xFF, 0xFF},{0xFF, 0xFF},{0xFF, 0xFF},{0xFF, 0xFF}};                // REVISIT : Will be loaded from eeprom
-  byte currentMonitorMode[numMonitors] = {0xFF, 0xFF};                                                             // REVISIT : Will be loaded from eeprom
-  byte monitorInputs[numMonitors][maxSupportedMonitorInputs] = {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},  // REVISIT : Will be loaded from eeprom
+    // LED flashing patterns
+      // 3 states + 2 idleBehaviour + 6 menu pages
+      const unsigned long msPerBit  = 4194304/16; // Roughly a second, 16bit resolution during that time
+      const int numStates = 4 + 6;
+      const unsigned int ledFlashCycles[numStates]= { // REVISIT : For a larger menu this can easily be extended so each sequence takes longer, more resolution.
+                                                      0b1111111111111111, // Idle Mode select
+                                                      0b1111110011111100, // Idle Input select
+                                                      0b1100110011001100, // Waiting for config
+                                                      0b1000001000001000, // Config menu 0
+                                                      0b1010000001010000, // Config menu 1
+                                                      0b1010100000000000, // Config menu 2
+                                                      0b1010101000000000, // Config menu 3
+                                                      0b1010101010000000, // Config menu 4
+                                                      0b1010101010100000  // Config menu 5
+      };
+
+
+    // Eeprom 
+      // Size
+        const int eepromSize_idleBehaviour = 1;
+        const int eepromSize_turnOnBehaviour = 1;
+        const int eepromSize_monitorModes = numModes*numMonitors;
+        const int eepromSize_currentMonitorMode = numMonitors;
+        const int eepromSize_monitorInputs = numMonitors*maxSupportedMonitorInputs;
+
+      // Addresses
+        const int eepromAddr_idleBehaviour = 0;
+        const int eepromAddr_turnOnBehaviour = eepromAddr_idleBehaviour + eepromSize_idleBehaviour;
+        const int eepromAddr_monitorModes = eepromAddr_turnOnBehaviour + eepromSize_turnOnBehaviour;
+        const int eepromAddr_currentMonitorMode = eepromAddr_monitorModes + eepromSize_monitorModes;
+        const int eepromAddr_monitorInputs = eepromAddr_currentMonitorMode + eepromSize_currentMonitorMode;
+        //const int eepromMaxAddr = eepromAddr_monitorInputs + eepromSize_monitorInputs;
+
+
+// Semi constants - loaded from eeprom
+  byte idleBehaviour = 0; // 0 is mode select, 1 is input switching                                               
+  byte turnOnBehaviour = 0; // 255 is just leave, 254 is previous state, others are just button saves.            
+  byte monitorModes[numModes][numMonitors] = {{0xFF, 0xFF},{0xFF, 0xFF},{0xFF, 0xFF},{0xFF, 0xFF}};               
+  byte currentMonitorMode[numMonitors] = {0xFF, 0xFF};                                                            
+  byte monitorInputs[numMonitors][maxSupportedMonitorInputs] = {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}, 
                                                                 {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
 
+  // Eeprom addresses
 
 // State values
-  int  state = 2; // 0 - idle, 1 - checking if settings mode, 2 - settings mode
+  int  state = 0; // 0 - idle, 1 - checking if settings mode, 2 - settings mode
   bool doneAction = 0;
   int  settingsCounter = 0;
   int  settingsPage  = 0; // 0 is main menu, 1 is setup button behaviour (values 0, 1 as above), 2 is turn on behaviour 
@@ -70,6 +105,7 @@
   int  selectedMode = -1;
   int  debugLevel = 3;
   bool ledState = false;
+  volatile byte ledCounter = 0;
 
 // Input objects
   // Buttons
@@ -84,19 +120,20 @@
 
 
 //// Generic functions START
-  void debugPrint(int level, const char *str, ...)
-  {
-    Serial.println("Attempt to use debugPrint");
-    if (debugLevel<level) return; // Only print messages that are equal to or less than the debug level
-    Serial.print(debugLevelStr[level]);
-    Serial.print(": ");
-    char buffer[256];
-    va_list args;
-    va_start(args, str);
-    vsprintf(buffer, str, args);
-    va_end(args);
-    Serial.println(buffer);
-  }
+  // REVISIT : make this work
+  //void debugPrint(int level, const char *str, ...)
+  //{
+  //  //Serial.println("Attempt to use debugPrint");
+  //  if (debugLevel<level) return; // Only print messages that are equal to or less than the debug level
+  //  //Serial.print(debugLevelStr[level]);
+  //  //Serial.print(": ");
+  //  char buffer[256];
+  //  va_list args;
+  //  va_start(args, str);
+  //  vsprintf(buffer, str, args);
+  //  va_end(args);
+  //  //Serial.println(buffer);
+  //}
 
   bool isValueInArray(byte arr[], int len, byte val)
   {
@@ -142,10 +179,10 @@
   {
     for (int i; i<len; i++) 
     {
-      Serial.print("0x");
-      Serial.print(Buffer[i]>>4,  HEX);
-      Serial.print(Buffer[i]&0x0F,HEX);
-      Serial.print(" ");
+      //Serial.print("0x");
+      //Serial.print(Buffer[i]>>4,  HEX);
+      //Serial.print(Buffer[i]&0x0F,HEX);
+      //Serial.print(" ");
     }
   }
 
@@ -161,21 +198,35 @@
     //debugPrint(3, "getMaxSetBit returned: -1");
     return -1;
   }
+
+
+  // startAddr is the start of the location in eeprom where the data is stored
+  // arr is an N dimensional array
+  // len is the total length of the array so multiplication of each dimension
+  // - we ignore the actual shape of the array - so long as it is consistently written and read it shouldn't matter
+  // isRead indicates that the access is to be a read, otherwise writes.
+  void eepromAccessor(int startAddr, byte arr[], int len, bool isRead)
+  {
+    for (int i=0; i<len; i++) {
+      int addr = startAddr + i;
+      if (isRead) {
+        arr[i] = EEPROM.read(addr);
+      } else { // is write 
+        EEPROM.write(addr, arr[i]);
+      }
+    } 
+  }
 //// Generic functions END
 
 
 //// Arduino Debug START
 
-void toggleLed()
-{
-  ledState = !ledState;
-  if (ledState) {
-    digitalWrite(ledPin, HIGH);
-  } else {
-    digitalWrite(ledPin, LOW);
-  }
+// REVISIT : the state system should be cleaned up somewhat to remove the need for the special ledStateNumber operation.
+void flashLED() {
+  int ledStateNumber = state == 0 ? idleBehaviour : 1 + state + settingsPage;
+  digitalWrite(ledPin, bitRead(ledFlashCycles[ledStateNumber], ledCounter));
+  ledCounter = ledCounter >= 15 ? 0 : ledCounter + 1;
 }
-
 
 
 //// Arduino Debug END
@@ -206,8 +257,8 @@ void toggleLed()
       i+=1;
     }
     //debugPrint(3, "i2cRead read num: %d, out of: %d", i-startIdx, numBytes);
-    Serial.print("numBytesRead = ");
-    Serial.println(i-startIdx);
+    //Serial.print("numBytesRead = ");
+    //Serial.println(i-startIdx);
     if (i-startIdx != numBytes) {
       return false;
     }
@@ -234,15 +285,15 @@ void toggleLed()
     byte trueLen = numBytes | lenMagicNum;
     byte checkSum = trueAddr ^ hostSlaveAddr ^ trueLen;
 
-    Serial.print("trueAddr: ");
-    Serial.print(trueAddr, HEX);
-    Serial.print(", ");
-    Serial.print("trueLen: ");
-    Serial.print(trueLen, HEX);
-    Serial.print(", ");
-    Serial.print("checkSum: ");
-    Serial.print(checkSum, HEX);
-    Serial.print(", ");
+    //Serial.print("trueAddr: ");
+    //Serial.print(trueAddr, HEX);
+    //Serial.print(", ");
+    //Serial.print("trueLen: ");
+    //Serial.print(trueLen, HEX);
+    //Serial.print(", ");
+    //Serial.print("checkSum: ");
+    //Serial.print(checkSum, HEX);
+    //Serial.print(", ");
 
     i2cMonitorPorts[monitor]->beginTransmission(addr);
     i2cMonitorPorts[monitor]->write(hostSlaveAddr);
@@ -250,33 +301,33 @@ void toggleLed()
     for (int i=0; i<numBytes; i++) {
       i2cMonitorPorts[monitor]->write(Buffer[i]);
       checkSum ^= Buffer[i];
-      Serial.print("Buffer[i]: ");
-      Serial.print(Buffer[i], HEX);
-      Serial.print(", ");
-      Serial.print("checkSum: ");
-      Serial.print(checkSum, HEX);
-      Serial.print(", ");
+      //Serial.print("Buffer[i]: ");
+      //Serial.print(Buffer[i], HEX);
+      //Serial.print(", ");
+      //Serial.print("checkSum: ");
+      //Serial.print(checkSum, HEX);
+      //Serial.print(", ");
     }
       i2cMonitorPorts[monitor]->write(checkSum);
     
-      Serial.println("end");
+      //Serial.println("end");
     return i2cMonitorPorts[monitor]->endTransmission() == 0;
   }
 
 //ddcRead(monitor, 0x37, 0x60, bufferInt, 11, 32);
   bool ddcRead(int monitor, byte addr, byte offset, byte Buffer[], int numBytes, bool isDdcWrite = true, int incr = 32) 
   {
-    Serial.print("ddcRead: ");
-    Serial.print("monitor: ");
-    Serial.print(monitor);
-    Serial.print(", addr: ");
-    Serial.print(addr, HEX);
-    Serial.print(", offset: ");
-    Serial.print(offset, HEX);
-    Serial.print(", numBytes: ");
-    Serial.print(numBytes);
-    Serial.print(", incr: ");
-    Serial.println(incr);
+    //Serial.print("ddcRead: ");
+    //Serial.print("monitor: ");
+    //Serial.print(monitor);
+    //Serial.print(", addr: ");
+    //Serial.print(addr, HEX);
+    //Serial.print(", offset: ");
+    //Serial.print(offset, HEX);
+    //Serial.print(", numBytes: ");
+    //Serial.print(numBytes);
+    //Serial.print(", incr: ");
+    //Serial.println(incr);
     //debugPrint(3, "ddcRead monitor: %d, numBytes: %d, addr: %X, offset: %X", monitor, numBytes, addr, offset);
     byte wrData[2] = {};
     bool result = true;
@@ -302,11 +353,11 @@ void toggleLed()
     }
 
     // Check checksum 
-    Serial.print(", result: ");
-    Serial.println(result);
-    result = result ; //& isChecksumValid(0x6E, Buffer, numBytes); REVISIT : Checksum not working correctly
-    Serial.print(", result: ");
-    Serial.println(result);
+    //Serial.print(", result: ");
+    //Serial.println(result);
+    result = result ; //& isChecksumValid(Buffer, numBytes); REVISIT : Checksum not working correctly
+    //Serial.print(", result: ");
+    //Serial.println(result);
 
     return result;
   }
@@ -317,9 +368,9 @@ void toggleLed()
     bool match;
     ddcRead(monitor, 0x50, 0x00, Buffer, len, false, 32);
     match = doArraysMatch(8, Buffer, edidHeader);
-    //Serial.print("EDID data: ");
+    ////Serial.print("EDID data: ");
     //print_byte_array(Buffer, 256);
-    //Serial.println("");
+    ////Serial.println("");
     //debugPrint(3, "edid_read monitor: %d, len: %d, match: %X", monitor, len, match);
     return match;
   }
@@ -337,10 +388,10 @@ void toggleLed()
   {
     byte bufferInt[11] = {};
     bool result = ddcRead(monitor, 0x37, 0x60, bufferInt, 11, true, 32);
-    Serial.print("readMonitorInput bufferInt = ");
+    //Serial.print("readMonitorInput bufferInt = ");
     print_byte_array(bufferInt, 11);
-    Serial.println("");
-    Serial.println(bufferInt[9]);
+    //Serial.println("");
+    //Serial.println(bufferInt[9]);
     *inputVal = bufferInt[9];
     //debugPrint(3, "readMonitorInput monitor: %d, inputVal: %X, success?: %X", monitor, *inputVal, result);
     return result;
@@ -359,9 +410,9 @@ void toggleLed()
   bool selectMonitorInput(int monitor, byte inputVal) 
   {
     byte inputValRead = 0xFF;
-    Serial.println("selectMonitorInput pre ");
-    Serial.println(monitor);
-    Serial.println(inputVal);
+    //Serial.println("selectMonitorInput pre ");
+    //Serial.println(monitor);
+    //Serial.println(inputVal);
 
     // write to monitor to select input
     writeMonitorInput(monitor, inputVal);
@@ -371,14 +422,14 @@ void toggleLed()
     // read back from monitor, if the value has stuck then the input is present
     readMonitorInput(monitor, &inputValRead);
 
-    Serial.print("selectMonitorInput post ");
+    //Serial.print("selectMonitorInput post ");
     bool result = inputVal == inputValRead;
     //debugPrint(3, "selectMonitorInput monitor: %d, inputVal: %X, success?: %X", monitor, inputVal, result);
-    Serial.print(inputVal);
-    Serial.print(" ");
-    Serial.print(inputValRead);
-    Serial.print(" ");
-    Serial.println(result);
+    //Serial.print(inputVal);
+    //Serial.print(" ");
+    //Serial.print(inputValRead);
+    //Serial.print(" ");
+    //Serial.println(result);
     return result;
   }
 //// Monitor Control Functions END
@@ -402,16 +453,16 @@ void toggleLed()
     byte inputVal;
     // For each monitor
     for (int i=0; i<numMonitors; i++) {
-      Serial.print("GetMonitorStates: ");
-      Serial.println(i);
+      //Serial.print("GetMonitorStates: ");
+      //Serial.println(i);
       result = 0xFF; // Default value -- invalid
       // Check if active
       if (is_monitor_connected(i)) { // Check if monitor is on -- maybe unnecessary
-        Serial.println("is connected");
+        //Serial.println("is connected");
         if (readMonitorInput(i, &inputVal)) // Read from ddc reg 60 (input) - only update result if it was successful
         {
-          Serial.println("Got monitor input read successfully");
-          Serial.println(inputVal);
+          //Serial.println("Got monitor input read successfully");
+          //Serial.println(inputVal);
           result = inputVal; // update result - monitor input value
         }
       }
@@ -451,42 +502,42 @@ void toggleLed()
     for (int i=0; i<numMonitors; i++) {
       //debugPrint(3, "setMonitorInputsAuto monitor loop before monitorInputs[%d]=%X", i, monitorInputs[i]);
       // If monitor not connected, skip
-      Serial.print("Auto detecting monitor: ");
-      Serial.println(i);
+      //Serial.print("Auto detecting monitor: ");
+      //Serial.println(i);
       if (!is_monitor_connected(i) ) {
-        Serial.println("Not connected");
+        //Serial.println("Not connected");
         continue;
       }
       // If override, delete all values
       if (override) {
-        Serial.println("Overriding");
+        //Serial.println("Overriding");
         for (int j=0; j<maxSupportedMonitorInputs; j++) {
           monitorInputs[i][j] = 0xFF;
         }
       }
       // Get possible inputs from monitor
       monitorMaxInputs = getPossibleInputs(i, maxValue, possibleInputs);
-      Serial.print("monitorMaxInputs: ");
-      Serial.println(monitorMaxInputs);
+      //Serial.print("monitorMaxInputs: ");
+      //Serial.println(monitorMaxInputs);
       
       // Get current max index for inputs
       monitorInputsCurIdx = getMonitorInputsMaxValidIdx(i) + 1 ;
-      Serial.print("monitorInputsCurIdx: ");
-      Serial.println(monitorInputsCurIdx);
+      //Serial.print("monitorInputsCurIdx: ");
+      //Serial.println(monitorInputsCurIdx);
 
       // For each possibleInput
       for (int j=0; j<monitorMaxInputs; j++) {
-      Serial.print("j: ");
-      Serial.println(j);
+      //Serial.print("j: ");
+      //Serial.println(j);
         // Check if the input is already in monitorInputs 
         if (!isValueInArray(monitorInputs[i], maxSupportedMonitorInputs, possibleInputs[j])) 
         {
-          Serial.println("isValueInArray");
+          //Serial.println("isValueInArray");
           if (monitorInputsCurIdx >= maxSupportedMonitorInputs) {
-            Serial.println("Hit max inputs");
+            //Serial.println("Hit max inputs");
             return;
           }
-          Serial.println("Not present - adding");
+          //Serial.println("Not present - adding");
           // If it isn't, add it
           monitorInputs[i][monitorInputsCurIdx] = possibleInputs[j];
           // Increment the counter and ensure no more than maxSupportedMonitorInputs are added (8)
@@ -494,9 +545,9 @@ void toggleLed()
         }
       }
       //debugPrint(3, "setMonitorInputsAuto monitor loop after monitorInputs[%d]=%X", i, monitorInputs[i]);
-      Serial.print("monitorInputs[i] = ");
+      //Serial.print("monitorInputs[i] = ");
       print_byte_array(monitorInputs[i], maxSupportedMonitorInputs);
-      Serial.println("");
+      //Serial.println("");
     }
   }
 
@@ -549,26 +600,26 @@ void toggleLed()
       case 3 : // Full FULL auto
         setMonitorInputsAuto(true, true);
         break;
-        
     }
+    eepromAccessor(eepromAddr_monitorInputs, *monitorInputs, eepromSize_monitorInputs, false);
   }
 
-  void setSetupMode(int idleBehaviourVal) 
+  void setSetupMode(byte idleBehaviourVal) 
   {
     //debugPrint(3, "setSetupMode");
-    // REVISIT: needs saving to eeprom
     idleBehaviour = idleBehaviourVal;
+    eepromAccessor(eepromAddr_idleBehaviour, &idleBehaviour, eepromSize_idleBehaviour, false);
   }
 
-  void setDefaultMode(int page, int turnOnBehaviourVal)  
+  void setDefaultMode(int page, byte turnOnBehaviourVal)  
   {
     //debugPrint(3, "setDefaultMode");
-    // REVISIT: needs saving to eeprom
     if (page==0 && turnOnBehaviourVal<=1) {
       turnOnBehaviour = -1-turnOnBehaviourVal;
     } else if (page==1) {
       turnOnBehaviour = turnOnBehaviourVal;
     }
+    eepromAccessor(eepromAddr_turnOnBehaviour, &turnOnBehaviour, eepromSize_turnOnBehaviour, false);
   }
 
   void setDebugLevel(int debugLevelVal)
@@ -584,10 +635,10 @@ void toggleLed()
     // Get monitor states, and set them in monitorModes for the selected mode
     getMonitorStates(monitorModes[selectedMode]);
 
-    Serial.print("monitorModes[selectedMode] = ");
+    //Serial.print("monitorModes[selectedMode] = ");
     print_byte_array(monitorModes[selectedMode], numMonitors);
-    Serial.println("");
-    // REVISIT: needs saving to eeprom
+    //Serial.println("");
+    eepromAccessor(eepromAddr_monitorModes, *monitorModes, eepromSize_monitorModes, false);
   }
 //// Settings Functions END
 
@@ -596,59 +647,71 @@ void toggleLed()
 
   void setMode(int selectedMode) 
   {
-    Serial.print("setMode: ");
-    Serial.print(selectedMode);
+    //Serial.print("setMode: ");
+    //Serial.print(selectedMode);
 
-    Serial.print("monitorModes[i] b= ");
+    //Serial.print("monitorModes[i] b= ");
     print_byte_array(monitorModes[selectedMode], numMonitors);
-    Serial.println("");
+    //Serial.println("");
 
+    //Serial.print("setMode selectedMode=");
+    //Serial.println(selectedMode);
     //debugPrint(3, "setMode");
     // For each monitor 
     for (int monNum=0; monNum<numMonitors; monNum++)
     {
+      byte monitorMode;
+      if (selectedMode<0 || selectedMode>numModes) {
+        monitorMode = currentMonitorMode[monNum];
+      } else {
+        monitorMode = monitorModes[selectedMode][monNum];
+      }
       // Set input to monitorModes[selectedMode][monitorI] = selectMonitorInput
-      selectMonitorInput(monNum, monitorModes[selectedMode][monNum]);
-      currentMonitorMode[monNum] = monitorModes[selectedMode][monNum];
+      selectMonitorInput(monNum, monitorMode);
+      currentMonitorMode[monNum] = monitorMode;
     }
-    // REVISIT: if turn on mode is to set to previous value
-      // Save to eeprom
-
+    // If turn on behaviour is to set to previous state - save state
+    if (turnOnBehaviour==254) {
+      eepromAccessor(eepromAddr_currentMonitorMode, currentMonitorMode, eepromSize_currentMonitorMode, false);
+    }
   }
 
+  // REVSIT share some code with setMode
   void incrementInput(int selectedMonitor) 
   {
-    Serial.print("incrementInput: ");
-    Serial.print(selectedMonitor);
+    //Serial.print("incrementInput: ");
+    //Serial.print(selectedMonitor);
     
-    Serial.print("monitorInputs[i] b= ");
+    //Serial.print("monitorInputs[i] b= ");
     print_byte_array(monitorInputs[selectedMonitor], maxSupportedMonitorInputs);
-    Serial.println("");
+    //Serial.println("");
 
-    Serial.print("currentMonitorMode[i] b= ");
-    Serial.print(currentMonitorMode[selectedMonitor], HEX);
-    Serial.println("");
+    //Serial.print("currentMonitorMode[i] b= ");
+    //Serial.print(currentMonitorMode[selectedMonitor], HEX);
+    //Serial.println("");
 
     //debugPrint(3, "incrementInput");
     // find current position currentMonitorMode[selectedMonitor] in monitorInputs[selectedMonitor]
     byte curInputIdx = whereIsValueInArray(monitorInputs[selectedMonitor], maxSupportedMonitorInputs, currentMonitorMode[selectedMonitor]);
 
-    Serial.println(curInputIdx);
+    //Serial.println(curInputIdx);
     // Find next value, N+1 or 0 if N+1==0xFF or out of range 
     byte maxInputIdx = getMonitorInputsMaxValidIdx(selectedMonitor);
-    Serial.println(maxInputIdx);
+    //Serial.println(maxInputIdx);
 
-    byte nxtInputIdx = curInputIdx == maxInputIdx ? 0 : curInputIdx + 1;
-    Serial.println(nxtInputIdx);
+    byte nxtInputIdx = curInputIdx >= maxInputIdx ? 0 : curInputIdx + 1;
+    //Serial.println(nxtInputIdx);
     byte nxtInputVal = monitorInputs[selectedMonitor][nxtInputIdx];
-    Serial.print("nextinputval: ");
-    Serial.println(nxtInputVal);
+    //Serial.print("nextinputval: ");
+    //Serial.println(nxtInputVal);
     // Set monitor to +1 of that index, loop around if next value is 0xFF
     selectMonitorInput(selectedMonitor, nxtInputVal);
-    currentMonitorMode[selectedMonitor] = nxtInputVal; // REVISIT : Move into select monitor input
+    currentMonitorMode[selectedMonitor] = nxtInputVal;
 
-    // REVISIT: if turn on mode is to set to previous value
-      // Save to eeprom
+    // If turn on behaviour is to set to previous state - save state
+    if (turnOnBehaviour==254) {
+      eepromAccessor(eepromAddr_currentMonitorMode, currentMonitorMode, eepromSize_currentMonitorMode, false);
+    }
 
   }
 //// Normal Operation Functions END
@@ -658,18 +721,13 @@ void toggleLed()
 void setup()
 {
   pinMode(ledPin, OUTPUT);
-  toggleLed();
   
   TWBR = 158; // Make clock really slow!
   //TWSR |= bit (TWPS0);
 
-  Serial.begin(115200); // REVISIT - could change speed
-  Serial.println("HDMI Switch");
+  Serial.begin(115200);
+  //Serial.println("HDMI Switch");
   //debugPrint(3, "setup");
-
-
-
-
 
   // Set up input buttons
   setupButton.attach( setupButtonPin , INPUT_PULLUP  );       //setup the bounce instance for the current button
@@ -687,17 +745,43 @@ void setup()
     i2cMonitorPorts[i]->setRxBuffer(i2cMonitorRxBuffers[i], sizeof(i2cMonitorRxBuffers[i]));
     i2cMonitorPorts[i]->setDelay_us(5);
     i2cMonitorPorts[i]->setTimeout(1000);
-    i2cMonitorPorts[i]->begin(); // REVISIT : could begin and end as required? check usage/power
+    i2cMonitorPorts[i]->begin();
   }  
   
   
-  // REVIST: Load variables from eeprom, initialize
-  for (int monNum=0; monNum<numMonitors; monNum++) // This will be the - don't change option
-  {
-    readMonitorInput(monNum, &currentMonitorMode[monNum]);
+  // Load variables from eeprom, initialize
+  eepromAccessor(eepromAddr_idleBehaviour, &idleBehaviour, eepromSize_idleBehaviour, true);
+  if (idleBehaviour > 1) {
+    idleBehaviour = 0;
   }
+  eepromAccessor(eepromAddr_turnOnBehaviour, &turnOnBehaviour, eepromSize_turnOnBehaviour, true);
+  eepromAccessor(eepromAddr_monitorModes, *monitorModes, eepromSize_monitorModes, true);
+  eepromAccessor(eepromAddr_monitorInputs, *monitorInputs, eepromSize_monitorInputs, true);
+  switch (turnOnBehaviour) { // -1 is previous state, -2 is just leave, others are just button saves.
+    case 255 :  
+      for (int monNum=0; monNum<numMonitors; monNum++) // This will be the - don't change option
+      {
+        readMonitorInput(monNum, &currentMonitorMode[monNum]);
+      }
+      break;
+    case 254 :
+      //Serial.println("Loading current monitor mode because turn on behaviour is 254");
+      eepromAccessor(eepromAddr_currentMonitorMode, currentMonitorMode, eepromSize_currentMonitorMode, true);
+      //Serial.print("currentMonitorMode = ");
+      print_byte_array(currentMonitorMode, 2);
+      //Serial.println("");
+      setMode(turnOnBehaviour);
+      break;
+    case 0 ... (numModes-1) :
+      setMode(turnOnBehaviour);
+      break;
+  }
+
+  Timer1.initialize(msPerBit);
+  Timer1.attachInterrupt(flashLED); // blinkLED to run every 0.15 seconds
+
   //debugPrint(3, "done setup");
-  Serial.println("Done setup\n\n");
+  //Serial.println("Done setup\n\n");
 }
 
 
@@ -705,12 +789,9 @@ void setup()
 void loop()
 {
   delay(loopDelay); // Sample inputs 20 times per second... Maybe sleep and wakeup on interrupt
-  toggleLed();
   //debugPrint(3, "Top of loop");
-  //Serial.println("Top of loop");
+  ////Serial.println("Top of loop");
 
-  // REVISIT : Interrupt routine for button press
-  
   // Temporary values
   bool setupButtonStatus = false;
   bool modeButtonStatus[numModes] = {false,false,false,false};
@@ -730,38 +811,29 @@ void loop()
   modeSelected = selectedMode > -1 ;
 
   //debugPrint(3, "loop done reads");
-  //Serial.println("Done reads");
+  ////Serial.println("Done reads");
 
-  Serial.print  ("state          : ");
-  Serial.print  (state          );
-  Serial.print  ("\tidleBehaviour   : ");
-  Serial.print  (idleBehaviour  );
-  Serial.print  ("\tturnOnBehaviour : ");
-  Serial.print  (turnOnBehaviour);
-  Serial.print  ("\tdoneAction     : ");
-  Serial.print  (doneAction     );
-  Serial.print  ("\tsettingsCounter: ");
-  Serial.print  (settingsCounter);
-  Serial.print  ("\tsettingsPage   : ");
-  Serial.print  (settingsPage   );
-  Serial.print  ("\tmodeSelected   : ");
-  Serial.print  (modeSelected   );
-  Serial.print  ("\tselectedMode   : ");
-  Serial.print  (selectedMode   );
-  Serial.print  ("\tdebugLevel     : ");
-  Serial.print  (debugLevel     );
-  Serial.print  ("\tledState       : ");
-  Serial.println(ledState       );
-
-
-
-  //byte monitorModes[numModes][numMonitors] = {{0xFF, 0xFF},{0xFF, 0xFF},{0xFF, 0xFF},{0xFF, 0xFF}};                // REVISIT : Will be loaded from eeprom
-  //byte currentMonitorMode[numMonitors] = {0xFF, 0xFF};                                                             // REVISIT : Will be loaded from eeprom
-  //byte monitorInputs[numMonitors][maxSupportedMonitorInputs] = {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},  // REVISIT : Will be loaded from eeprom
-  //                                                              {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
-
-
-
+  // REVISIT : sometimes this gets split across 2-3 lines... But inconsistently 
+  //Serial.print  ("\tstate          : ");
+  //Serial.print  (state          );
+  //Serial.print  ("\tidleBehaviour   : ");
+  //Serial.print  (idleBehaviour  );
+  //Serial.print  ("\tturnOnBehaviour : ");
+  //Serial.print  (turnOnBehaviour);
+  //Serial.print  ("\tdoneAction     : ");
+  //Serial.print  (doneAction     );
+  //Serial.print  ("\tsettingsCounter: ");
+  //Serial.print  (settingsCounter);
+  //Serial.print  ("\tsettingsPage   : ");
+  //Serial.print  (settingsPage   );
+  ////Serial.print  ("\tmodeSelected   : ");
+  ////Serial.print  (modeSelected   );
+  ////Serial.print  ("\tselectedMode   : ");
+  ////Serial.print  (selectedMode   );
+  ////Serial.print  ("\tdebugLevel     : ");
+  ////Serial.print  (debugLevel     );
+  //Serial.print  ("\tledState       : ");
+  //Serial.println(ledState       );
 
   // Main state machine
   if (!doneAction) {
@@ -824,9 +896,9 @@ void loop()
         }
 
         // Navigate menu
-        //Serial.println(settingsMenu[settingsPage]);
-        Serial.println(modeSelected);
-        Serial.println(settingsMenu[settingsPage][selectedMode]);
+        ////Serial.println(settingsMenu[settingsPage]);
+        //Serial.println(modeSelected);
+        //Serial.println(settingsMenu[settingsPage][selectedMode]);
         settingsPage = settingsMenu[settingsPage][selectedMode];
         doneAction = true;
       } // If no button pressed, do nothing
@@ -840,7 +912,7 @@ void loop()
       doneAction = false;
     }
   }
-  //Serial.println("End of loop");
+  ////Serial.println("End of loop");
 
 
 }
