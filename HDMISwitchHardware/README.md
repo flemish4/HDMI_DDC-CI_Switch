@@ -1,0 +1,1 @@
+This folder would contain hardware schematics and board layouts for a full KVM switch based on the ddc/ci solution - including USB switch and hub, and possibly hotkey detection (although this is difficult with usb).
