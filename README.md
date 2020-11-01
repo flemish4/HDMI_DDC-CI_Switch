@@ -86,6 +86,6 @@ If the sleep problem could be fixed, the next phase was to implement HDMI passth
 
 ## Diagrams
 
-![Schematic](blob/master/HDMISwitchHardware/basic_schem.png?raw=true "Schematic")
-![Fritzing](blob/master/HDMISwitchHardware/basic_bb.png?raw=true "Fritzing")
-![Flow diagram](blob/master/HDMISwitch/flow_diagram.png?raw=true "Flow diagram")
+![Schematic](HDMISwitchHardware/basic_schem.png?raw=true "Schematic")
+![Fritzing](HDMISwitchHardware/basic_bb.png?raw=true "Fritzing")
+![Flow diagram](HDMISwitch/flow_diagram.png?raw=true "Flow diagram")
