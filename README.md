@@ -21,8 +21,8 @@ Normal KVMs should implement a DDC/CI/HPD scheme, where each PC always believes 
 
 ## Setup
 
-The project was tested on an arduino uno, with vscode and platformio as the ide. The only external components required are: 4 resistors (i2c pullups), 2 resistors (HDMI 5v current limiting - should really be an IC), 5 push buttons. See end of readme for schematic and diagram.
-
+The project was tested on an arduino uno, with vscode and platformio as the ide. The only external components required are: 4 resistors (i2c pullups), 2 resistors (HDMI 5v current limiting - should really be an IC), 5 push buttons and two female HDMI ports with only have 5v, GND, I2CDAT, I2CCLK signals connected. These are connected to a spare input on each monitor (so each monitor requires 3+ inputs).
+See end of readme for schematic and diagram.
 ## Usage - Overview
 
 The project implements 5 buttons, 1 'setup' button and 4 'mode' buttons.
@@ -50,30 +50,30 @@ At any time in the menu, press 'setup' to exit the menu.
 1. Press any of the set mode buttons - the monitors should switch to that configuration!
 
 ## Full settings menu description
+Pressing 'setup' at any time will return you to idle, not in settings menu.
+Completing any operation in settings menu will return you to Main settings menu.
+|Level 0|Level 1|Level 2|Level 3|
+|--|--|--|--|
+|Main|
+||0. Change setup button behaviour||
+|||0. Mode select|
+||| 1. Input select|
+||1. Change turn on behaviour||
+|||0. Do not change|
+|||1. As turn off state|
+|||2. Select mode|
+||||0,1,2,3. Respective mode is set|
+||2. Configure monitor input switching||
+|||0. Automatic detection|
+|||1. Extract in order from preset modes|
+|||2. Extract from modes then add any extras found during automatic detection|
+||3. (Not fully implemented) Change serial debug levels||
+|||0. No debug|
+|||1. Errors only|
+|||2. Warnings and errors|
+|||3. All debug|
 
- 0. Main
-	 0. Change setup button behaviour
-		 0. Mode select
-		 0. Input select
-	 1. Change turn on behaviour
-		 0. Do not change
-		 1. As turn off state
-		 2. Select mode 0,1,2,3 : Turn on to the selected mode
-	 2. Configure monitor input switching
-		 0. Automatic detection
-		 1. Extract in order from preset modes
-		 2. Extract from modes then add any extras found during automatic detection
-	 3. (Not fully implemented) Change serial debug levels
-		 0. No debug
-		 1. Errors only
-		 2. Warnings and errors
-		 3. All debug
-
-## Full settings menu
-
-    
-The current version of this project uses two female HDMI connectors which only have 5v, GND, i2cDat, i2cClk signals connected. These are connected to a spare input on each monitor (so monitor requires 3+ inputs).
-<h2>Future if sleep issue is overcome</h2>
+## Future if sleep issue is overcome
 If the sleep problem could be fixed, the next phase was to implement HDMI passthrough. In this case, HDMI signals would be passed through so that no extra input is required. The only additional complexity is a gate between the HDMI input and output on the i2c lines, to enable the HDMI_DDC/CI_KVM to change the input (removing the PC master). This should be relatively simple, if PCs are able to notice this disconnect, it may be possible to hold the i2c clk line low until the input switching is complete, which should make the PC wait.
 
 ## References
@@ -86,6 +86,6 @@ If the sleep problem could be fixed, the next phase was to implement HDMI passth
 
 ## Diagrams
 
-![Schematic](HDMISwitchHardware/basic_schem.png?raw=true "Schematic")
-![Fritzing](HDMISwitchHardware/basic_bb.png?raw=true "Fritzing")
-![Flow diagram](HDMISwitch/flow_diagram.png?raw=true "Flow diagram")
+![Schematic](blob/master/HDMISwitchHardware/basic_schem.png?raw=true "Schematic")
+![Fritzing](blob/master/HDMISwitchHardware/basic_bb.png?raw=true "Fritzing")
+![Flow diagram](blob/master/HDMISwitch/flow_diagram.png?raw=true "Flow diagram")
